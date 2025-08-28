@@ -1,150 +1,120 @@
-package com.rsc;
-
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public class EventDrivenScheduler
-{
+public class EventDrivenScheduler {
+
+    // One state per producer
+    private static class ProducerState {
+        final Deque<Chunkable> queue = new ArrayDeque<>();
+        boolean inFlight = false;
+    }
+
+    // Task contract: do up to timeSliceMs work; return true when fully done.
+    public interface Chunkable {
+        boolean runChunk(long timeSliceMs);
+    }
+
     private final Map<String, ProducerState> producers = new ConcurrentHashMap<>();
+
+    // Active producers that (may) have runnable work. We keep a set to avoid duplicates.
     private final BlockingQueue<String> activeProducers = new LinkedBlockingQueue<>();
     private final Set<String> activeSet = ConcurrentHashMap.newKeySet();
 
     private final ExecutorService workers;
     private final long timeSliceMs;
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private Thread dispatcherThread;
 
-    public EventDrivenScheduler(int workerThreads, long timeSliceMs)
-    {
+    public EventDrivenScheduler(int workerThreads, long timeSliceMs) {
         this.workers = Executors.newFixedThreadPool(workerThreads);
         this.timeSliceMs = timeSliceMs;
     }
 
-    private static class QueuedTask
-    {
-        final Object key;
-        final Chunkable task;
-
-        QueuedTask(Object key, Chunkable task)
-        {
-            this.key = key;
-            this.task = task;
-        }
-    }
-
-    private static class ProducerState
-    {
-        final Deque<QueuedTask> queue = new ArrayDeque<>();
-        boolean inFlight = false;
-        Object inFlightKey = null;
-    }
-
-    public interface Chunkable
-    {
-        /**
-         * @return true if finished, false if needs more chunks
-         */
-        boolean runChunk(long timeSliceMs);
-    }
-
-    public boolean submit(String producerId, Object key, Chunkable task)
-    {
+    // Submit a task to a producer (FIFO). No conflation, no key logic.
+    public void submit(String producerId, Chunkable task) {
         ProducerState ps = producers.computeIfAbsent(producerId, k -> new ProducerState());
-        synchronized (ps)
-        {
-            if (ps.queue.stream().anyMatch(qt -> qt.key.equals(key)) ||
-                    (ps.inFlight && ps.inFlightKey.equals(key)))
-            {
-                // Drop duplicate work for same key
-                return false;
-            }
-            ps.queue.addLast(new QueuedTask(key, task));
+        synchronized (ps) {
+            ps.queue.addLast(task);
         }
-        if (activeSet.add(producerId))
-        {
+        // Mark producer active if not already queued for dispatch
+        ensureActive(producerId);
+    }
+
+    public void start() {
+        if (!running.compareAndSet(false, true)) return;
+        dispatcherThread = new Thread(this::runLoop, "event-dispatcher");
+        dispatcherThread.setDaemon(true);
+        dispatcherThread.start();
+    }
+
+    public void stop() {
+        if (!running.compareAndSet(true, false)) return;
+        workers.shutdown();
+        if (dispatcherThread != null) {
+            dispatcherThread.interrupt();
+        }
+    }
+
+    private void ensureActive(String producerId) {
+        if (activeSet.add(producerId)) {
             activeProducers.offer(producerId);
         }
-        return true;
     }
 
-    public void start()
-    {
-        if (running.compareAndSet(false, true))
-        {
-            Thread dispatcher = new Thread(this::runLoop, "dispatcher");
-            dispatcher.start();
-        }
-    }
+    private void runLoop() {
+        try {
+            while (running.get()) {
+                String pid = activeProducers.take();   // blocks until some producer is active
+                // Critical: remove from active set immediately upon dequeue.
+                // This allows completion or new submissions to re-enqueue if needed.
+                activeSet.remove(pid);
 
-    public void stop()
-    {
-        running.set(false);
-        workers.shutdown();
-    }
-
-    private void runLoop()
-    {
-        try
-        {
-            while (running.get())
-            {
-                String pid = activeProducers.take(); // blocks until active producer
                 ProducerState ps = producers.get(pid);
-                if (ps == null)
-                {
-                    activeSet.remove(pid);
-                    continue;
-                }
-                boolean stillHasWork = dispatchFromProducer(pid, ps);
-                if (stillHasWork)
-                {
-                    activeProducers.offer(pid);
-                }
-                else
-                {
-                    activeSet.remove(pid);
-                }
+                if (ps == null) continue;
+
+                dispatchOneFromProducer(pid, ps);
+                // Do not re-offer here. Only submission or completion re-enqueues.
             }
-        } catch (InterruptedException e)
-        {
+        } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
         }
     }
 
-    private boolean dispatchFromProducer(String pid, ProducerState ps)
-    {
-        QueuedTask taskToRun;
-        synchronized (ps)
-        {
-            if (ps.inFlight || ps.queue.isEmpty())
-            {
-                return !ps.queue.isEmpty();
+    private void dispatchOneFromProducer(String pid, ProducerState ps) {
+        Chunkable taskToRun = null;
+        synchronized (ps) {
+            if (ps.inFlight || ps.queue.isEmpty()) {
+                return; // Either busy or no work; completion/submission will re-enqueue as needed
             }
             taskToRun = ps.queue.pollFirst();
             ps.inFlight = true;
-            ps.inFlightKey = taskToRun.key;
         }
 
+        final Chunkable run = taskToRun;
         workers.submit(() -> {
-            boolean finished = taskToRun.task.runChunk(timeSliceMs);
-            synchronized (ps)
-            {
-                if (!finished)
-                {
-                    // Requeue unfinished task at head
-                    ps.queue.addFirst(taskToRun);
+            boolean finished = false;
+            try {
+                finished = run.runChunk(timeSliceMs);
+            } catch (Throwable t) {
+                // Treat exceptions as task finished; you could add logging/metrics here.
+                finished = true;
+            }
+
+            boolean hasMore;
+            synchronized (ps) {
+                if (!finished) {
+                    // Place incomplete task back at the head (chunking semantics)
+                    ps.queue.addFirst(run);
                 }
                 ps.inFlight = false;
-                ps.inFlightKey = null;
+                hasMore = !ps.queue.isEmpty();
             }
-            if (!ps.queue.isEmpty())
-            {
-                if (activeSet.add(pid))
-                {
-                    activeProducers.offer(pid);
-                }
+
+            // If producer still has work, re-enqueue it (idempotent thanks to activeSet)
+            if (hasMore) {
+                ensureActive(pid);
             }
         });
-        return false;
     }
 }
